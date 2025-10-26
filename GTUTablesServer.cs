@@ -121,7 +121,7 @@ class GTUTablesServer
         }
     }
 
-    public static async Task<string> GetData(string tid)
+    private string GetData(string tid)
     {
         string df = Encoding.UTF8.GetString(TableBytes);
         string target = $"{tid}</th></tr>";
@@ -204,6 +204,7 @@ body { background-color: #121212; color: #ffffff; }
     {
         Thread fetchThread = new Thread(FetcherThread);
         fetchThread.Start();
+        while (TableBytes == null || TableBytes.Length == 0);
         listener.Start();
         Console.WriteLine($"Listening...");
         while (true)
@@ -270,7 +271,6 @@ body { background-color: #121212; color: #ffffff; }
                     stream.Flush();
 
                     string tempp = Encoding.UTF8.GetString(dataBuffer);
-
                     if (tempp != null)
                     {
                         string message = Decrypt(tempp, "table");
@@ -278,7 +278,7 @@ body { background-color: #121212; color: #ffffff; }
                         Console.WriteLine("Requested: " + message);
 #endif
                         while (isFetching);
-                        string response = await GetData(message);
+                        string response = GetData(message);
                         response = Encrypt(response, "table");
                         byte[] tosend = Encoding.UTF8.GetBytes(Encoding.UTF8.GetBytes(response).Length + "L" + response);
                         stream.Write(tosend, 0, tosend.Length);
