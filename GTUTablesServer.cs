@@ -233,11 +233,16 @@ body { background-color: #121212; color: #ffffff; }
                 {
                     byte[] dtsize = new byte[1];
                     StringBuilder sbbb = new StringBuilder();
-
-                    for (int i = 0; i < 64; i++)
+                    int iter = 0;
+                    for (iter = 0; iter < 5; iter++)
                     {
-                        stream.Read(dtsize, 0, 1);
+                        try
+                        {
+                            stream.Read(dtsize, 0, 1);
+                        }
+                        catch (Exception _) { }
                         if (Convert.ToChar(dtsize[0]) == 'L') break;
+                        else if (iter >= 5) return;
                         sbbb.Append(Encoding.UTF8.GetString(dtsize));
                     }
 
