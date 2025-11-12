@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -87,10 +88,28 @@ class GTUTablesServer
         return days[dayIndex];
     }
 
+    public static bool IsInternetAvailable()
+    {
+        try
+        {
+            var ping = new Ping();
+            var reply = ping.Send("8.8.8.8", 1000);
+            return reply.Status == IPStatus.Success;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public static async Task<string> FetchUrlContentAsync(string url)
     {
         try
         {
+            while (!IsInternetAvailable())
+            {
+                await Task.Delay(5000);
+            }
             using HttpClient client = new HttpClient();
             client.Timeout = TimeSpan.FromSeconds(120);
             return await client.GetStringAsync(url);
