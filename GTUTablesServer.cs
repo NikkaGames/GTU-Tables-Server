@@ -4,6 +4,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 class GTUTablesServer
@@ -52,6 +53,7 @@ class GTUTablesServer
         }
         return sb.ToString();
     }
+
     public static string GetMins()
     {
         return DateTime.Now.Minute.ToString("D2");
@@ -140,6 +142,60 @@ class GTUTablesServer
         }
     }
 
+    private string Inject(string html, string timeSlot, int cellIndex, string subject, string teacher, string room)
+    {
+        string marker = timeSlot;
+        int mid = html.IndexOf(marker, StringComparison.Ordinal);
+        if (mid == -1) return html;
+
+        int trStart = html.LastIndexOf("<tr", mid, StringComparison.Ordinal);
+        if (trStart == -1) return html;
+
+        int depth = 0;
+        int rowEnd = -1;
+        for (int i = trStart; i < html.Length; i++)
+        {
+            if (i + 3 <= html.Length && html.AsSpan(i).StartsWith("<tr".AsSpan(), StringComparison.Ordinal))
+            {
+                depth++;
+            }
+            else if (i + 5 <= html.Length && html.AsSpan(i).StartsWith("</tr>".AsSpan(), StringComparison.Ordinal))
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    rowEnd = i + 5;
+                    break;
+                }
+            }
+        }
+        if (rowEnd == -1) return html;
+
+        string row = html.Substring(trStart, rowEnd - trStart);
+        const string token = "<td>---</td>";
+        int count = 0;
+        int pos = 0;
+        var sb = new StringBuilder();
+        while (true)
+        {
+            int k = row.IndexOf(token, pos, StringComparison.Ordinal);
+            if (k == -1)
+            {
+                sb.Append(row, pos, row.Length - pos);
+                break;
+            }
+            sb.Append(row, pos, k - pos);
+            count++;
+            if (count == cellIndex)
+                sb.Append("<td>" + subject + "<br>" + teacher + "<br>" + room + "<br></td>");
+            else
+                sb.Append(token);
+            pos = k + token.Length;
+        }
+        string newRow = sb.ToString();
+        return html.Substring(0, trStart) + newRow + html.Substring(rowEnd);
+    }
+
     private string GetData(string tid)
     {
         string df = Encoding.UTF8.GetString(TableBytes);
@@ -149,6 +205,12 @@ class GTUTablesServer
 
         string dff = df.Substring(Math.Max(0, index - 129));
         string dfff = dff.Substring(0, Math.Max(0, dff.IndexOf("#top") - 31));
+
+        if (tid == "108434-1")
+        {
+            dfff = Inject(dfff, "5-13:00", 2, "საინჟინრო მათემატიკა 2\n(დამატებითი)\nლექცია", "თემურ ჯანგველაძე", "06-411ბ");
+            dfff = Inject(dfff, "6-14:00", 2, "საინჟინრო მათემატიკა 2\n(დამატებითი)\nპრაქტიკული", "თემურ ჯანგველაძე", "06-411ბ");
+        }
 
         string baseHtml = @"
 <html xmlns=""http://www.w3.org/1999/xhtml"" lang=""ge"" xml:lang=""ge"">
@@ -216,7 +278,8 @@ body { background-color: #121212; color: #ffffff; }
 </div>
 </body></html>";
 
-        return baseHtml + tval + footer;
+        string ret = baseHtml + tval + footer;
+        return ret;
     }
 
     public void Start()
