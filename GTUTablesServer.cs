@@ -1,396 +1,609 @@
-﻿using System;
 using System.Net;
-using System.Net.NetworkInformation;
+using System.Net.Http;
 using System.Net.Sockets;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
 
-class GTUTablesServer
+public sealed class GTUTablesServer : IDisposable
 {
-    private TcpListener listener;
-    public static byte[] TableBytes;
-    public static bool isFetching = true;
+    private const string CipherKey = "table";
+    private const int MaxClients = 64;
+    private const int MaxRequestBytes = 4096;
+    private const int MaxResponseBytes = 8 * 1024 * 1024;
+    private const int MaxHtmlChars = 16 * 1024 * 1024;
+    private const int MaxTimetableSources = 64;
+    private const int MaxConcurrentDownloads = 4;
+    private static readonly Uri HomeUri = new("https://leqtori.gtu.ge/");
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromHours(2);
+    private static readonly TimeSpan RetryInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ClientIdleTimeout = TimeSpan.FromSeconds(30);
 
-    public GTUTablesServer(IPAddress ipAddress, int port)
-    {
-        listener = new TcpListener(ipAddress, port);
-    }
+    private static readonly Regex AnchorRegex = new(
+        @"<a\b(?<attributes>[^>]*)>(?<label>.*?)</a\s*>",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline,
+        TimeSpan.FromSeconds(2));
 
-    public static bool Contains(string input, string target)
-    {
-        return input.Contains(target);
-    }
+    private static readonly Regex HrefRegex = new(
+        """\bhref\s*=\s*(?:"(?<url>[^"]+)"|'(?<url>[^']+)'|(?<url>[^\s>]+))""",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(2));
 
-    public static bool Equals(string first, string second)
-    {
-        return string.Equals(first, second);
-    }
+    private static readonly Regex HtmlTagsRegex = new(
+        @"<[^>]+>", RegexOptions.Compiled, TimeSpan.FromSeconds(2));
 
-    public static string Encrypt(string input, string key)
+    private static readonly Regex GroupLabelRegex = new(
+        @"groups|ჯგუფ", RegexOptions.Compiled | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(2));
+
+    private static readonly Regex TeacherLabelRegex = new(
+        @"teachers|lecturers|პედაგოგ", RegexOptions.Compiled | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(2));
+
+    private static readonly Regex RoomLabelRegex = new(
+        @"rooms|აუდიტორი", RegexOptions.Compiled | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(2));
+
+    private static readonly Regex TeacherFilenameRegex = new(
+        @"prof_teachers\.html?", RegexOptions.Compiled | RegexOptions.IgnoreCase,
+        TimeSpan.FromSeconds(2));
+
+    private static readonly TimeZoneInfo GeorgiaTimeZone = ResolveGeorgiaZone();
+
+    private readonly TcpListener _listener;
+    private readonly SemaphoreSlim _clientSlots = new(MaxClients, MaxClients);
+    private readonly HttpClient _httpClient;
+    private TimetableSnapshot? _snapshot;
+    private bool _disposed;
+
+    public GTUTablesServer(IPAddress address, int port)
     {
-        if (string.IsNullOrEmpty(key)) return input;
-        var sb = new StringBuilder(input.Length);
-        for (int i = 0; i < input.Length; i++)
+        _listener = new TcpListener(address, port);
+        _httpClient = new HttpClient(new SocketsHttpHandler
         {
-            int shift = key[i % key.Length];
-            char encrypted = (char)((input[i] + shift) & 0xFFFF);
-            sb.Append(encrypted);
-        }
-        return sb.ToString();
-    }
-
-    public static string Decrypt(string input, string key)
-    {
-        if (string.IsNullOrEmpty(key)) return input;
-        var sb = new StringBuilder(input.Length);
-        for (int i = 0; i < input.Length; i++)
+            AutomaticDecompression = DecompressionMethods.GZip |
+                                     DecompressionMethods.Deflate |
+                                     DecompressionMethods.Brotli
+        })
         {
-            int shift = key[i % key.Length];
-            char decrypted = (char)((input[i] - shift) & 0xFFFF);
-            sb.Append(decrypted);
-        }
-        return sb.ToString();
-    }
-
-    public static string GetMins()
-    {
-        return DateTime.Now.Minute.ToString("D2");
-    }
-
-    public static string GetTime()
-    {
-        int hour = DateTime.Now.Hour;
-        if (hour < 9 || hour > 22) return "0-Unknown";
-        int index = hour - 8;
-        return $"{index}-{hour}:00";
-    }
-
-    public static string GetNextTime()
-    {
-        int nextHour = DateTime.Now.Hour + 1;
-        if (nextHour > 22) return "0-Unknown";
-        int index = nextHour - 8;
-        return $"{index}-{nextHour}:00";
-    }
-
-    public static string GetDay()
-    {
-        string[] days = {
-            "კვი./Sun.",
-            "ორშ./Mon.",
-            "სამშ./Tues.",
-            "ოთხშ./Wed.",
-            "ხუთშ./Thurs.",
-            "პარ./Fri.",
-            "შაბ./Sat."
+            Timeout = TimeSpan.FromSeconds(40)
         };
-        int dayIndex = (int)DateTime.Now.DayOfWeek;
-        return days[dayIndex];
     }
 
-    public static bool IsInternetAvailable()
+    public async Task RunAsync(CancellationToken shutdownToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
+        CancellationToken token = lifetime.Token;
+        var clientTasks = new List<Task>(MaxClients);
+
+        _listener.Start();
+        Console.WriteLine($"Listening on {_listener.LocalEndpoint}");
+
+        Task refreshTask = RefreshLoopAsync(token);
         try
         {
-            var ping = new Ping();
-            var reply = ping.Send("8.8.8.8", 1000);
-            return reply.Status == IPStatus.Success;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    public static async Task<string> FetchUrlContentAsync(string url)
-    {
-        try
-        {
-            while (!IsInternetAvailable())
+            while (!token.IsCancellationRequested)
             {
-                await Task.Delay(5000);
-            }
-            using HttpClient client = new HttpClient();
-            client.Timeout = TimeSpan.FromSeconds(120);
-            return await client.GetStringAsync(url);
-        }
-        catch (Exception ex)
-        {
-            return ex.ToString();
-        }
-    }
+                await _clientSlots.WaitAsync(token);
+                TcpClient client;
 
-    private async void FetcherThread()
-    {
-        while (true)
-        {
-            try
-            {
-                isFetching = true;
-                string first = await FetchUrlContentAsync("https://leqtori.gtu.ge/");
-                string first_split = $"{first.Substring(first.IndexOf("prof_teachers.html\" target=\"_blank\"><strong>rs</strong></a></p><p class=\"ql-align-center\"><a href=\"") + 99)}";
-                string table_data = await FetchUrlContentAsync($"{first_split.Substring(0, first_split.IndexOf(".html\"") + 5)}");
-                TableBytes = Encoding.Default.GetBytes(table_data);
-                isFetching = false;
-            } catch (Exception ex)
-            {
-                Console.WriteLine(ex.ToString());
-            }
-            Thread.Sleep(7200 * 1000); // 2 hours I guess :D
-        }
-    }
-
-    private string Inject(string html, string timeSlot, int cellIndex, string subject, string teacher, string room)
-    {
-        string marker = timeSlot;
-        int mid = html.IndexOf(marker, StringComparison.Ordinal);
-        if (mid == -1) return html;
-
-        int trStart = html.LastIndexOf("<tr", mid, StringComparison.Ordinal);
-        if (trStart == -1) return html;
-
-        int depth = 0;
-        int rowEnd = -1;
-        for (int i = trStart; i < html.Length; i++)
-        {
-            if (i + 3 <= html.Length && html.AsSpan(i).StartsWith("<tr".AsSpan(), StringComparison.Ordinal))
-            {
-                depth++;
-            }
-            else if (i + 5 <= html.Length && html.AsSpan(i).StartsWith("</tr>".AsSpan(), StringComparison.Ordinal))
-            {
-                depth--;
-                if (depth == 0)
+                try
                 {
-                    rowEnd = i + 5;
-                    break;
+                    client = await _listener.AcceptTcpClientAsync(token);
                 }
-            }
-        }
-        if (rowEnd == -1) return html;
-
-        string row = html.Substring(trStart, rowEnd - trStart);
-        const string token = "<td>---</td>";
-        int count = 0;
-        int pos = 0;
-        var sb = new StringBuilder();
-        while (true)
-        {
-            int k = row.IndexOf(token, pos, StringComparison.Ordinal);
-            if (k == -1)
-            {
-                sb.Append(row, pos, row.Length - pos);
-                break;
-            }
-            sb.Append(row, pos, k - pos);
-            count++;
-            if (count == cellIndex)
-                sb.Append("<td>" + subject + "<br>" + teacher + "<br>" + room + "<br></td>");
-            else
-                sb.Append(token);
-            pos = k + token.Length;
-        }
-        string newRow = sb.ToString();
-        return html.Substring(0, trStart) + newRow + html.Substring(rowEnd);
-    }
-
-    private string GetData(string tid)
-    {
-        string df = Encoding.UTF8.GetString(TableBytes);
-        string target = $"{tid}</th></tr>";
-        int index = df.IndexOf(target);
-        if (index == -1) return "NOT_FOUND";
-
-        string dff = df.Substring(Math.Max(0, index - 129));
-        string dfff = dff.Substring(0, Math.Max(0, dff.IndexOf("#top") - 31));
-
-        if (tid == "108434-1")
-        {
-            dfff = Inject(dfff, "5-13:00", 2, "საინჟინრო მათემატიკა 2\n(დამატებითი)\nლექცია", "თემურ ჯანგველაძე", "06-411ბ");
-            dfff = Inject(dfff, "6-14:00", 2, "საინჟინრო მათემატიკა 2\n(დამატებითი)\nპრაქტიკული", "თემურ ჯანგველაძე", "06-411ბ");
-        }
-
-        string baseHtml = @"
-<html xmlns=""http://www.w3.org/1999/xhtml"" lang=""ge"" xml:lang=""ge"">
-<head>
-<meta http-equiv=""Content-Type"" content=""text/html; charset=UTF-8"">
-<link rel=""stylesheet"" href=""https://cdnjs.cloudflare.com/ajax/libs/font-awesome/4.7.0/css/font-awesome.min.css"">
-<style>
-@import url(https://fonts.googleapis.com/css?family=Open+Sans);
-.inf{zoom: 2.5; display: flex;}
-.fa{padding: 0px;font-size: 36px;width: auto;height: auto;text-align: center;text-decoration: none;border-radius: 50%; margin-left: 8px;}
-.fa-facebook{width: 30px; height: 30px; border-radius: 50%; align-items: center; display: flex; justify-content: center;background: #3B5998;color: white;}
-.fa-telegram{width: 30px; height: 30px; border-radius: 50%; align-items: center; display: flex; justify-content: center;background: #25AFE2;color: white;}
-.fa-instagram{width: 30px; height: 30px; border-radius: 50%; align-items: center; display: flex; justify-content: center;background: #FF3ED8;color: white;}
-.fa-github{width: 30px; height: 30px;border-radius: 50%;align-items: center; display: flex; justify-content: center;background: #666666;color: white;}
-.center-div {align-items: center; justify-content: center; display: flex; font-size: 30px; font-family: 'Open Sans'; max-width: fit-content; margin-left: auto;margin-right: auto;background-color: #121212; color: #ffffff;}
-table {border-collapse: collapse;font-family: 'Open Sans'; background-color: #1E1E1E; color: #ffffff;}
-table td {padding: 8px; color: #ffffff; border: 1px solid #444;}
-table thead td {background-color: #333333;color: #ffffff;font-weight: bold;font-size: 14px;border: 1px solid #444;}
-table tbody td {color: #ffffff;border: 1px solid #555;}
-table tbody tr {background-color: #1E1E1E;}
-table tbody tr:nth-child(odd) {background-color: #2A2A2A;}
-.lecture {background-color: #1c7cd0; color: #fff;}
-.lab {background-color: #52aa35; color: #fff;}
-.practical {background-color: #de8f18; color: #fff;}
-.practic {background-color: #c65316; color: #fff;}
-.seminar {background-color: #761e8f; color: #fff;}
-.course {background-color: #bc2a2a; color: #fff;}
-body { background-color: #121212; color: #ffffff; }
-</style>
-</head>
-<body>";
-
-        string day = GetDay();
-
-        string tval = dfff;
-        if (!day.Equals("კვი./Sun."))
-        {
-            int mins = int.Parse(GetMins());
-            string time = GetTime();
-            string nextTime = GetNextTime();
-
-            if (mins >= 45)
-                tval = tval.Replace($"<th class=\"yAxis\">{time}</th>", $"<th class=\"yAxis\"><font color=\"orange\">{time}<br>(ENDING SOON)</font></th>");
-            else
-                tval = tval.Replace($"<th class=\"yAxis\">{time}</th>", $"<th class=\"yAxis\"><font color=\"red\">{time}<br>(NOW)</font></th>");
-
-            if (mins >= 55)
-                tval = tval.Replace($"<th class=\"yAxis\">{nextTime}</th>", $"<th class=\"yAxis\"><font color=\"#009DD7\">{nextTime}<br>(STARTING SOON)</font></th>");
-            else
-                tval = tval.Replace($"<th class=\"yAxis\">{nextTime}</th>", $"<th class=\"yAxis\"><font color=\"green\">{nextTime}<br>(NEXT)</font></th>");
-
-            tval = tval.Replace($"<th class=\"xAxis\">{day}</th>", $"<th class=\"xAxis\"><font color=\"red\">{day} (TODAY)</font></th>");
-        }
-
-        string footer = @"
-<br><br>
-<div class=""center-div"">
-<b>App Creator:</b><br><br>
-<div class=""inf"">
-<a href=""https://t.me/s/NikkaGamesOfficial"" class=""fa fa-telegram""></a>
-<a href=""https://facebook.com/sunflower.thrust"" class=""fa fa-facebook""></a>
-<a href=""https://www.instagram.com/pmicdxe"" class=""fa fa-instagram""></a>
-<a href=""https://github.com/NikkaGames"" class=""fa fa-github""></a>
-</div>
-</div>
-</body></html>";
-
-        string ret = baseHtml + tval + footer;
-        return ret;
-    }
-
-    public void Start()
-    {
-        Thread fetchThread = new Thread(FetcherThread);
-        fetchThread.Start();
-        while (TableBytes == null || TableBytes.Length == 0);
-        listener.Start();
-        Console.WriteLine($"Listening...");
-        while (true)
-        {
-            TcpClient client = listener.AcceptTcpClient();
-            IPEndPoint endPoint = (IPEndPoint)client.Client.RemoteEndPoint;
-            IPAddress address = endPoint.Address;
-            int port = endPoint.Port;
-#if DEBUG
-            Console.WriteLine($"Request from {address}:{port}");
-#endif
-            Thread clientThread = new Thread(HandleClient);
-            clientThread.Start(client);
-        }
-    }
-
-    public async void HandleClient(object clientObj)
-    {
-        TcpClient client = (TcpClient)clientObj;
-        NetworkStream stream = client.GetStream();
-        try
-        {
-            while (true)
-            {
-                if (stream.CanRead)
+                catch
                 {
-                    byte[] dtsize = new byte[1];
-                    StringBuilder sbbb = new StringBuilder();
-                    int iter = 0;
-                    for (iter = 0; iter < 5; iter++)
-                    {
-                        try
-                        {
-                            stream.Read(dtsize, 0, 1);
-                        }
-                        catch (Exception _) { }
-                        if (Convert.ToChar(dtsize[0]) == 'L') break;
-                        else if (iter >= 5) return;
-                        sbbb.Append(Encoding.UTF8.GetString(dtsize));
-                    }
-
-                    int sizz = 0;
-                    try
-                    {
-                        sizz = int.Parse(sbbb.ToString());
-                    }
-                    catch (FormatException wxx)
-                    {
-                        stream.Flush();
-                        break;
-                    }
-
-                    byte[] dataBuffer = new byte[sizz];
-                    int totalBytesRead = 0;
-                    while (totalBytesRead < sizz)
-                    {
-                        int bytesToRead = sizz - totalBytesRead;
-                        int bytesRead = await stream.ReadAsync(dataBuffer, totalBytesRead, bytesToRead);
-                        if (bytesRead == 0)
-                        {
-#if DEBUG
-                            Console.WriteLine("Client disconnected during data transmission");
-#endif
-                            break;
-                        }
-                        totalBytesRead += bytesRead;
-                    }
-
-                    stream.Flush();
-
-                    string tempp = Encoding.UTF8.GetString(dataBuffer);
-                    if (tempp != null)
-                    {
-                        string message = Decrypt(tempp, "table");
-#if DEBUG
-                        Console.WriteLine("Requested: " + message);
-#endif
-                        while (isFetching);
-                        string response = GetData(message);
-                        response = Encrypt(response, "table");
-                        byte[] tosend = Encoding.UTF8.GetBytes(Encoding.UTF8.GetBytes(response).Length + "L" + response);
-                        stream.Write(tosend, 0, tosend.Length);
-                        stream.Flush();
-#if DEBUG
-                        if (response.Length >= 32)
-                            Console.WriteLine($"Sent {tosend.Length} bytes of data: {Encoding.UTF8.GetString(tosend).Substring(0, 32)} (First 32 bytes).");
-                        else Console.WriteLine($"Sent {tosend.Length} bytes of data.");
-#endif
-                    }
-                    else break;
+                    _clientSlots.Release();
+                    throw;
                 }
+
+                clientTasks.RemoveAll(static task => task.IsCompleted);
+                clientTasks.Add(ServeClientAsync(client, token));
             }
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            Console.WriteLine(ex.ToString());
-            return;
         }
         finally
         {
-#if DEBUG
-            Console.WriteLine("Client disconnected.");
-#endif
+            lifetime.Cancel();
+            _listener.Stop();
+            await Task.WhenAll(clientTasks);
+            await refreshTask;
         }
     }
-}
+    public void Start() => RunAsync().GetAwaiter().GetResult();
 
+    private async Task RefreshLoopAsync(CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            TimeSpan delay = RefreshInterval;
+            try
+            {
+                (string homepage, Uri finalUri) = await FetchHtmlAsync(HomeUri, token);
+                IReadOnlyList<TimetableLink> links = DiscoverTimetables(homepage, finalUri);
+                if (links.Count == 0)
+                {
+                    Console.Error.WriteLine(DescribeDiscoveryFailure(homepage, finalUri));
+                    throw new InvalidDataException("No GTU HTML timetable links found.");
+                }
+
+                TimetableSnapshot? previous = Volatile.Read(ref _snapshot);
+                using var downloadSlots = new SemaphoreSlim(MaxConcurrentDownloads);
+                Task<TimetableFetch>[] downloads = links.Select(async link =>
+                {
+                    await downloadSlots.WaitAsync(token);
+                    try
+                    {
+                        (string html, _) = await FetchHtmlAsync(link.Uri, token);
+                        if (!TimetableRenderer.LooksLikeTimetable(html))
+                            throw new InvalidDataException("Not a supported GTU HTML timetable.");
+                        return new TimetableFetch(link, html, null);
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        return new TimetableFetch(link, null, ex);
+                    }
+                    finally
+                    {
+                        downloadSlots.Release();
+                    }
+                }).ToArray();
+
+                TimetableFetch[] results = await Task.WhenAll(downloads);
+                var pages = new List<TimetablePage>(results.Length);
+                int updated = 0;
+                int failed = 0;
+
+                foreach (TimetableFetch result in results)
+                {
+                    if (result.Html is not null)
+                    {
+                        pages.Add(new TimetablePage(result.Link, result.Html));
+                        updated++;
+                        continue;
+                    }
+
+                    failed++;
+                    Console.Error.WriteLine($"Timetable unavailable: {result.Link.Uri.AbsoluteUri} ({result.Error?.Message})");
+                    TimetablePage? old = previous?.Pages.FirstOrDefault(page => page.Link.Uri == result.Link.Uri);
+                    if (old is not null)
+                        pages.Add(new TimetablePage(result.Link, old.Html, stale: true));
+                }
+
+                if (pages.Count == 0)
+                    throw new InvalidDataException($"All {links.Count} timetable sources failed; retaining prior snapshot.");
+                pages.Sort(static (a, b) =>
+                {
+                    int priority = a.Link.Category.CompareTo(b.Link.Category);
+                    return priority != 0 ? priority : a.Link.Order.CompareTo(b.Link.Order);
+                });
+                Volatile.Write(ref _snapshot, new TimetableSnapshot(pages.ToArray()));
+                Console.WriteLine($"Timetables refreshed: {updated} downloaded, {pages.Count - updated} cached, " +
+                                  $"{failed} failed, {pages.Count} available at {DateTimeOffset.UtcNow:O}");
+                if (failed > 0)
+                    delay = RetryInterval;
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Refresh failed: {ex}");
+                delay = RetryInterval;
+            }
+
+            try
+            {
+                await Task.Delay(delay, token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+    }
+
+    private async Task<(string Html, Uri FinalUri)> FetchHtmlAsync(Uri uri, CancellationToken token)
+    {
+        Console.WriteLine($"Fetching {uri.AbsoluteUri}");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(40));
+        CancellationToken requestToken = timeout.Token;
+        using HttpResponseMessage response = await _httpClient.GetAsync(
+            uri, HttpCompletionOption.ResponseHeadersRead, requestToken);
+        response.EnsureSuccessStatusCode();
+
+        if (response.Content.Headers.ContentLength > MaxHtmlChars)
+            throw new InvalidDataException($"HTML exceeds {MaxHtmlChars} bytes.");
+
+        Encoding encoding = Encoding.UTF8;
+        string? charset = response.Content.Headers.ContentType?.CharSet?.Trim('"');
+        if (!string.IsNullOrWhiteSpace(charset))
+        {
+            try { encoding = Encoding.GetEncoding(charset); }
+            catch (ArgumentException) { }
+        }
+
+        await using Stream body = await response.Content.ReadAsStreamAsync(requestToken);
+        using var reader = new StreamReader(body, encoding, detectEncodingFromByteOrderMarks: true);
+        var html = new StringBuilder();
+        char[] chars = new char[16 * 1024];
+
+        int read;
+        while ((read = await reader.ReadAsync(chars.AsMemory(), requestToken)) != 0)
+        {
+            if (html.Length + read > MaxHtmlChars)
+                throw new InvalidDataException($"HTML exceeds {MaxHtmlChars} characters.");
+            html.Append(chars, 0, read);
+        }
+
+        return (html.ToString(), response.RequestMessage?.RequestUri ?? uri);
+    }
+    internal static IReadOnlyList<TimetableLink> DiscoverTimetables(string homepage, Uri baseUri)
+    {
+        var found = new Dictionary<string, TimetableLink>(StringComparer.OrdinalIgnoreCase);
+        int order = 0;
+
+        void Add(string raw, string label, TimetableCategory? categoryOverride = null)
+        {
+            if (!TryMakeGtURi(baseUri, raw, out Uri? uri))
+                return;
+            TimetableCategory? category = categoryOverride ?? ClassifyTimetable(uri!, label);
+            if (category is null)
+                return;
+
+            string key = uri!.AbsoluteUri;
+            if (!found.TryGetValue(key, out TimetableLink? old))
+            {
+                found.Add(key, new TimetableLink(uri, category.Value, label, order++));
+            }
+            else if (category.Value < old.Category)
+            {
+                found[key] = old with { Category = category.Value, Label = label };
+            }
+        }
+
+        foreach (Match anchor in AnchorRegex.Matches(homepage))
+        {
+            Match href = HrefRegex.Match(anchor.Groups["attributes"].Value);
+            if (!href.Success)
+                continue;
+            string label = WebUtility.HtmlDecode(HtmlTagsRegex.Replace(
+                anchor.Groups["label"].Value, string.Empty)).Trim();
+            Add(href.Groups["url"].Value, label);
+        }
+        MatchCollection allLinks = HrefRegex.Matches(homepage);
+        for (int i = 0; i < allLinks.Count; i++)
+        {
+            string raw = allLinks[i].Groups["url"].Value;
+            Add(raw, string.Empty);
+            if (TryMakeGtURi(baseUri, raw, out Uri? current) &&
+                (TeacherFilenameRegex.IsMatch(current!.AbsolutePath) ||
+                 ClassifyTimetable(current, string.Empty) == TimetableCategory.Teachers) &&
+                i + 1 < allLinks.Count &&
+                allLinks[i + 1].Index - allLinks[i].Index < 2500)
+            {
+                string next = allLinks[i + 1].Groups["url"].Value;
+                if (TryMakeGtURi(baseUri, next, out Uri? nextUri) &&
+                    ClassifyTimetable(nextUri!, string.Empty) is null)
+                    Add(next, "Groups (legacy link ordering)", TimetableCategory.Groups);
+            }
+        }
+        string? legacyUrl = Environment.GetEnvironmentVariable("GTU_GROUPS_URL");
+        if (!string.IsNullOrWhiteSpace(legacyUrl))
+            Add(legacyUrl, "Configured Groups", TimetableCategory.Groups);
+
+        string? manualUrls = Environment.GetEnvironmentVariable("GTU_TIMETABLE_URLS");
+        if (!string.IsNullOrWhiteSpace(manualUrls))
+        {
+            foreach (string entry in manualUrls.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+                Add(entry, "Configured timetable", TimetableCategory.Additional);
+        }
+
+        if (found.Count > MaxTimetableSources)
+            throw new InvalidDataException($"GTU advertised {found.Count} HTML timetables; limit is {MaxTimetableSources}.");
+
+        return found.Values.OrderBy(link => link.Order).ToArray();
+    }
+    internal static IReadOnlyList<Uri> FindGroupsUris(string homepage, Uri baseUri) =>
+        DiscoverTimetables(homepage, baseUri)
+            .Where(link => link.Category == TimetableCategory.Groups)
+            .Select(link => link.Uri)
+            .ToArray();
+
+    private static TimetableCategory? ClassifyTimetable(Uri uri, string label)
+    {
+        string path = Uri.UnescapeDataString(uri.AbsolutePath);
+        if (!path.EndsWith(".html", StringComparison.OrdinalIgnoreCase) &&
+            !path.EndsWith(".htm", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        string filename = Path.GetFileName(path);
+        if (filename.Contains("group", StringComparison.OrdinalIgnoreCase) ||
+            GroupLabelRegex.IsMatch(label))
+            return TimetableCategory.Groups;
+        if (filename.Contains("teacher", StringComparison.OrdinalIgnoreCase) ||
+            TeacherLabelRegex.IsMatch(label))
+            return TimetableCategory.Teachers;
+        if (filename.Contains("room", StringComparison.OrdinalIgnoreCase) ||
+            RoomLabelRegex.IsMatch(label))
+            return TimetableCategory.Rooms;
+        if (path.StartsWith("/public/", StringComparison.OrdinalIgnoreCase))
+            return TimetableCategory.Additional;
+
+        return null;
+    }
+
+    private static bool TryMakeGtURi(Uri baseUri, string raw, out Uri? uri)
+    {
+        uri = null;
+        raw = WebUtility.HtmlDecode(raw).Trim();
+        if (raw.Length == 0 || !Uri.TryCreate(baseUri, raw, out Uri? parsed))
+            return false;
+        if (!parsed.Host.Equals(HomeUri.Host, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (!parsed.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+            !parsed.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (parsed.GetLeftPart(UriPartial.Path) == baseUri.GetLeftPart(UriPartial.Path) &&
+            parsed.Query == baseUri.Query)
+            return false;
+
+        uri = parsed;
+        return true;
+    }
+
+    private static string DescribeDiscoveryFailure(string html, Uri uri)
+    {
+        Match group = GroupLabelRegex.Match(html);
+        string nearGroup = group.Success
+            ? html.Substring(Math.Max(0, group.Index - 240),
+                Math.Min(html.Length - Math.Max(0, group.Index - 240), 650))
+            : "<no Groups/ჯგუფ label>";
+        nearGroup = Regex.Replace(nearGroup, @"\s+", " ");
+        MatchCollection links = HrefRegex.Matches(html);
+        string examples = string.Join(", ", links.Cast<Match>()
+            .Take(12).Select(match => WebUtility.HtmlDecode(match.Groups["url"].Value)));
+        return $"Timetable link discovery failed. Final URI: {uri}; " +
+               $"HTML length: {html.Length}; href count: {links.Count}; " +
+               $"href samples: [{examples}]; around Groups label: {nearGroup}";
+    }
+
+    private async Task ServeClientAsync(TcpClient client, CancellationToken shutdownToken)
+    {
+        try
+        {
+            using (client)
+            {
+                client.NoDelay = true;
+                using NetworkStream stream = client.GetStream();
+                Console.WriteLine($"Connected: {client.Client.RemoteEndPoint}");
+
+                while (!shutdownToken.IsCancellationRequested)
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken);
+                    timeout.CancelAfter(ClientIdleTimeout);
+
+                    string? groupId = await ReadRequestAsync(stream, timeout.Token);
+                    if (groupId is null)
+                        break;
+
+                    byte[] content = Encoding.UTF8.GetBytes(Encrypt(GetData(groupId), CipherKey));
+                    if (content.Length > MaxResponseBytes)
+                        content = Encoding.UTF8.GetBytes(Encrypt("RESPONSE_TOO_LARGE", CipherKey));
+
+                    byte[] prefix = Encoding.ASCII.GetBytes($"{content.Length}L");
+                    await stream.WriteAsync(prefix, timeout.Token);
+                    await stream.WriteAsync(content, timeout.Token);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested)
+        {
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or InvalidDataException)
+        {
+            Console.Error.WriteLine($"Client connection closed: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unhandled client error: {ex}");
+        }
+        finally
+        {
+            _clientSlots.Release();
+        }
+    }
+
+    private static async Task<string?> ReadRequestAsync(NetworkStream stream, CancellationToken token)
+    {
+        byte[] single = new byte[1];
+        int length = 0;
+        int digits = 0;
+
+        while (true)
+        {
+            int read = await stream.ReadAsync(single, token);
+            if (read == 0)
+            {
+                if (digits != 0)
+                    throw new EndOfStreamException("Incomplete request header.");
+                return null;
+            }
+
+            byte ch = single[0];
+            if (ch == (byte)'L')
+            {
+                if (digits == 0 || length == 0)
+                    throw new InvalidDataException("Empty request length.");
+                break;
+            }
+
+            if (ch < (byte)'0' || ch > (byte)'9' || digits >= 9)
+                throw new InvalidDataException("Malformed request length prefix.");
+
+            length = checked(length * 10 + ch - (byte)'0');
+            if (length > MaxRequestBytes)
+                throw new InvalidDataException("Request exceeds size limit.");
+            digits++;
+        }
+
+        byte[] payload = new byte[length];
+        await stream.ReadExactlyAsync(payload, token);
+        string decrypted = Decrypt(Encoding.UTF8.GetString(payload), CipherKey).Trim();
+        if (decrypted.Length is < 1 or > 128 ||
+            decrypted.IndexOfAny(['<', '>', '\r', '\n', '\0']) >= 0)
+        {
+            throw new InvalidDataException("Invalid group ID.");
+        }
+
+        return decrypted;
+    }
+
+    internal string GetData(string request)
+    {
+        TimetableSnapshot? snapshot = Volatile.Read(ref _snapshot);
+        if (snapshot is null)
+            return "SERVICE_UNAVAILABLE";
+
+        TimetableCategory? filter = null;
+        string id = request;
+        int separator = request.IndexOf(':');
+        if (separator is > 0 and < 12)
+        {
+            string prefix = request[..separator].ToLowerInvariant();
+            filter = prefix switch
+            {
+                "group" or "groups" => TimetableCategory.Groups,
+                "teacher" or "teachers" => TimetableCategory.Teachers,
+                "room" or "rooms" => TimetableCategory.Rooms,
+                "additional" or "faculty" => TimetableCategory.Additional,
+                _ => null
+            };
+            if (filter is not null)
+                id = request[(separator + 1)..].Trim();
+        }
+
+        if (id.Length == 0)
+            return "NOT_FOUND";
+
+        string key = filter is null ? $"any:{id}" : $"{(int)filter.Value}:{id}";
+        string? content = snapshot.Cache.GetOrCreate(key,
+            () => FindMatchingTables(snapshot.Pages, filter, id));
+        if (content is null)
+            return "NOT_FOUND";
+
+        DateTimeOffset georgianNow = TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, GeorgiaTimeZone);
+        return TimetableRenderer.Render(content, georgianNow);
+    }
+
+    private static string? FindMatchingTables(TimetablePage[] pages, TimetableCategory? filter, string id)
+    {
+        var matches = new List<(string Label, string Table)>();
+        foreach (TimetablePage page in pages)
+        {
+            if (filter is not null && page.Link.Category != filter.Value)
+                continue;
+            if (filter is null && matches.Count > 0 &&
+                page.Link.Category >= TimetableCategory.Teachers)
+                break;
+
+            string? section = TimetableRenderer.ExtractGroupTable(page.Html, id);
+            if (section is null)
+                continue;
+
+            string label = string.IsNullOrWhiteSpace(page.Link.Label)
+                ? Path.GetFileName(Uri.UnescapeDataString(page.Link.Uri.AbsolutePath))
+                : page.Link.Label;
+            matches.Add((label, section));
+        }
+
+        if (matches.Count == 0)
+            return null;
+
+        return matches.Count == 1
+            ? matches[0].Table
+            : string.Join("\n", matches.Select(match =>
+                $"<h3>{WebUtility.HtmlEncode(match.Label)}</h3>\n{match.Table}"));
+    }
+
+    public static string Encrypt(string input, string key) => Transform(input, key, +1);
+    public static string Decrypt(string input, string key) => Transform(input, key, -1);
+
+    private static string Transform(string input, string key, int direction)
+    {
+        if (string.IsNullOrEmpty(key))
+            return input;
+
+        char[] result = new char[input.Length];
+        for (int i = 0; i < input.Length; i++)
+            result[i] = unchecked((char)(input[i] + direction * key[i % key.Length]));
+        return new string(result);
+    }
+
+    private static TimeZoneInfo ResolveGeorgiaZone()
+    {
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById("Asia/Tbilisi");
+        }
+        catch (TimeZoneNotFoundException)
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById("Georgian Standard Time");
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        _listener.Stop();
+        _httpClient.Dispose();
+        _clientSlots.Dispose();
+    }
+
+    internal enum TimetableCategory
+    {
+        Groups = 0,
+        Additional = 1,
+        Teachers = 2,
+        Rooms = 3
+    }
+
+    internal sealed record TimetableLink(Uri Uri, TimetableCategory Category, string Label, int Order);
+    private sealed record TimetableFetch(TimetableLink Link, string? Html, Exception? Error);
+    internal void SetTimetablesForTests(params (TimetableLink Link, string Html)[] sources) =>
+        Volatile.Write(ref _snapshot, new TimetableSnapshot(
+            sources.Select(source => new TimetablePage(source.Link, source.Html))
+                   .OrderBy(page => page.Link.Category)
+                   .ThenBy(page => page.Link.Order)
+                   .ToArray()));
+
+    internal int CachedTableCountForTests => Volatile.Read(ref _snapshot)?.Cache.Count ?? 0;
+
+    private sealed class TimetableSnapshot(TimetablePage[] pages)
+    {
+        public TimetablePage[] Pages { get; } = pages;
+        public TimetableCache Cache { get; } = new();
+    }
+
+    private sealed class TimetablePage(TimetableLink link, string html, bool stale = false)
+    {
+        public TimetableLink Link { get; } = link;
+        public string Html { get; } = html;
+        public bool Stale { get; } = stale;
+    }
+}
